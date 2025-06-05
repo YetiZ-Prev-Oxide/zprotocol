@@ -36,7 +36,7 @@ func main() {
 		return
 	}
 
-	//  upload directory from user
+	// get upload directory from user
 	fmt.Print("Enter the path to site directory(containing your files and config.json): ")
 	var uploadDir string
 	fmt.Scanln(&uploadDir)
@@ -46,7 +46,7 @@ func main() {
 		return
 	}
 
-	// Validate the upload directory and config
+	// validate the upload directory and config
 	config, err := validateUploadDirectory(uploadDir)
 	if err != nil {
 		fmt.Printf("Validation failed: %v\n", err)
@@ -64,11 +64,12 @@ func main() {
 		return
 	}
 
-	//  unique folder name based on domain and timestamp
+	// create unique folder name based on domain and timestamp
 	timestamp := time.Now().Format("20060102-150405")
 	folderName := fmt.Sprintf("%s-%s", sanitizeDomainName(config.Domain), timestamp)
 	
-	repoDir := "./tmp-repo"
+	// use system temp directory to avoid git conflicts
+	repoDir := filepath.Join(os.TempDir(), "z-protocol-repo")
 	
 	// clone or pull repo
 	r, err := cloneOrPullRepo(repoURL, repoDir, username, githubToken)
@@ -77,7 +78,7 @@ func main() {
 		return
 	}
 
-	// target directory in repo
+	// create target directory in repo
 	targetDir := filepath.Join(repoDir, "sites", folderName)
 	err = os.MkdirAll(targetDir, 0755)
 	if err != nil {
@@ -85,7 +86,7 @@ func main() {
 		return
 	}
 
-	// copy files from upload directory to target directory
+	// copy all files from upload directory to target directory
 	err = copyDirectory(uploadDir, targetDir)
 	if err != nil {
 		fmt.Printf("Failed to copy files: %v\n", err)
@@ -103,7 +104,7 @@ func main() {
 	fmt.Printf("Site folder: sites/%s\n", folderName)
 	fmt.Printf("Config: %+v\n", config)
 	
-	// extract repo name from URL for GitHub Pages link
+	// extract repo name from URL for github pages link
 	repoName := extractRepoName(repoURL)
 	if repoName != "" {
 		fmt.Printf("GitHub Pages URL: https://%s.github.io/%s/sites/%s/\n", username, repoName, folderName)
@@ -111,18 +112,18 @@ func main() {
 }
 
 func validateUploadDirectory(uploadDir string) (*SiteConfig, error) {
-	// Check if directory exists
+	// check if directory exists
 	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
 		return nil, fmt.Errorf("directory does not exist: %s", uploadDir)
 	}
 
-	// Check if config.json exists
+	// check if config.json exists
 	configPath := filepath.Join(uploadDir, "config.json")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("config.json not found in directory: %s", uploadDir)
 	}
 
-	// Read and parse config.json
+	// read and parse config.json
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config.json: %v", err)
@@ -134,7 +135,7 @@ func validateUploadDirectory(uploadDir string) (*SiteConfig, error) {
 		return nil, fmt.Errorf("failed to parse config.json: %v", err)
 	}
 
-	// Validate required fields
+	// validate required fields
 	if strings.TrimSpace(config.Title) == "" {
 		return nil, fmt.Errorf("config.json must contain a non-empty 'title' field")
 	}
@@ -147,25 +148,25 @@ func validateUploadDirectory(uploadDir string) (*SiteConfig, error) {
 }
 
 func sanitizeDomainName(domain string) string {
-	// Remove protocol if present
+	// remove protocol if present
 	domain = strings.TrimPrefix(domain, "http://")
 	domain = strings.TrimPrefix(domain, "https://")
 	
-	// Replace invalid characters with hyphens
+	// replace invalid characters with hyphens
 	domain = strings.ReplaceAll(domain, ".", "-")
 	domain = strings.ReplaceAll(domain, "/", "-")
 	domain = strings.ReplaceAll(domain, ":", "-")
 	domain = strings.ReplaceAll(domain, " ", "-")
 	
-	// Remove multiple consecutive hyphens
+	// remove multiple consecutive hyphens
 	for strings.Contains(domain, "--") {
 		domain = strings.ReplaceAll(domain, "--", "-")
 	}
 	
-	// Trim hyphens from ends
+	// trim hyphens from ends
 	domain = strings.Trim(domain, "-")
 	
-	// Limit length
+	// limit length
 	if len(domain) > 30 {
 		domain = domain[:30]
 	}
@@ -212,20 +213,20 @@ func copyDirectory(src, dst string) error {
 			return err
 		}
 
-		// Calculate relative path
+		// calculate relative path
 		relPath, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
 		}
 
-		// Calculate destination path
+		// calculate destination path
 		dstPath := filepath.Join(dst, relPath)
 
 		if d.IsDir() {
 			return os.MkdirAll(dstPath, d.Type())
 		}
 
-		// Copy file
+		// copy file
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
@@ -257,7 +258,7 @@ func commitAndPush(r *git.Repository, folderName string, config *SiteConfig, use
 		return fmt.Errorf("commit failed: %v", err)
 	}
 
-	fmt.Println("Pushing to git")
+	fmt.Println("Pushing to github...")
 	err = r.Push(&git.PushOptions{
 		Auth: &http.BasicAuth{
 			Username: username,
@@ -272,11 +273,11 @@ func commitAndPush(r *git.Repository, folderName string, config *SiteConfig, use
 }
 
 func extractRepoName(repoURL string) string {
-	// etract repo name from site URL
+	// extract repo name from github URL
 	parts := strings.Split(repoURL, "/")
 	if len(parts) >= 2 {
 		repoName := parts[len(parts)-1]
-		// remove .git if present
+		// remove .git suffix if present
 		repoName = strings.TrimSuffix(repoName, ".git")
 		return repoName
 	}
