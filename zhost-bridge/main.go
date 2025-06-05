@@ -65,8 +65,7 @@ func main() {
 	}
 
 	// create unique folder name based on domain and timestamp
-	timestamp := time.Now().Format("20060102-150405")
-	folderName := fmt.Sprintf("%s-%s", sanitizeDomainName(config.Domain), timestamp)
+	folderName := fmt.Sprintf("%s", sanitizeDomainName(config.Domain))
 	
 	// use system temp directory to avoid git conflicts
 	repoDir := filepath.Join(os.TempDir(), "z-protocol-repo")
