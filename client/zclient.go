@@ -29,12 +29,13 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 	
 	for {
-		fmt.Println("\n=== Z  Client ===")
+		fmt.Println("\n=== Z Protocol Client ===")
 		fmt.Println("Choose request type:")
-		fmt.Println("1. ZGET")
-		fmt.Println("2. ZPUT")
-		fmt.Println("3. Exit")
-		fmt.Print("action: ")
+		fmt.Println("1. ZGET - Get file")
+		fmt.Println("2. ZPUT - Upload file")
+		fmt.Println("3. ZDEPLOY - Deploy site to GitHub")
+		fmt.Println("4. Exit")
+		fmt.Print("Action: ")
 
 		choiceStr, _ := reader.ReadString('\n')
 		choiceStr = strings.TrimSpace(choiceStr)
@@ -42,7 +43,7 @@ func main() {
 		var choice int
 		fmt.Sscanf(choiceStr, "%d", &choice)
 
-		if choice == 3 {
+		if choice == 4 {
 			fmt.Println("Exiting program...")
 			break
 		}
@@ -70,6 +71,20 @@ func main() {
 			content = strings.TrimSpace(content)
 
 			request = fmt.Sprintf("ZPUT %s Z/1.0\nContent-Length: %d\n\n%s", path, len(content), content)
+			sendRequest(request)
+
+		case 3:
+			// ZDEPLOY
+			fmt.Print("Enter local folder path (containing index.html and config.json): ")
+			folderPath, _ := reader.ReadString('\n')
+			folderPath = strings.TrimSpace(folderPath)
+
+			if folderPath == "" {
+				fmt.Println("No folder path provided")
+				continue
+			}
+
+			request = fmt.Sprintf("ZDEPLOY / Z/1.0\nContent-Length: %d\n\n%s", len(folderPath), folderPath)
 			sendRequest(request)
 			
 		default:
