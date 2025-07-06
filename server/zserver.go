@@ -379,6 +379,84 @@ func (s *ZServer) isGitHubPagesDomain(domain string) bool {
 	githubPagesPattern := regexp.MustCompile(`^[a-zA-Z0-9\-]+\.github\.io(?:/[a-zA-Z0-9\-_.]+)?$`)
 	return githubPagesPattern.MatchString(domain)
 }
+// Fetch index.html from zhostpages
+func (s *ZServer) fetchGitHubPagesHTML(username, repoName, filePath string) (string, error) {
+	
+	// Strategy 1: Try GitHub Pages direct URL (this is what users actually see)
+	pagesURL := fmt.Sprintf("https://%s.github.io/%s/%s", username, repoName, filePath)
+	if repoName == fmt.Sprintf("%s.github.io", username) {
+		// For user/org pages, the URL is just username.github.io
+		pagesURL = fmt.Sprintf("https://%s.github.io/%s", username, filePath)
+	}
+	
+	fmt.Printf("Trying GitHub Pages URL: %s\n", pagesURL)
+	htmlContent, err := s.fetchRawContent(pagesURL)
+	if err == nil {
+		fmt.Printf("SUCCESS: Found content at GitHub Pages URL\n")
+		return htmlContent, nil
+	}
+	fmt.Printf("GitHub Pages URL failed: %v\n", err)
+
+	//  Try raw GitHub content from different branches
+	branches := []string{"gh-pages", "main", "master"}
+	
+	for _, branch := range branches {
+		//  different raw URL formats
+		rawURLs := []string{
+			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", username, repoName, branch, filePath),
+			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s", username, repoName, branch, filePath),
+		}
+		
+		for _, rawURL := range rawURLs {
+			fmt.Printf("Trying raw URL: %s\n", rawURL)
+			htmlContent, err := s.fetchRawContent(rawURL)
+			if err == nil {
+				fmt.Printf("SUCCESS: Found content at raw URL\n")
+				return htmlContent, nil
+			}
+			fmt.Printf("Raw URL failed: %v\n", err)
+		}
+	}
+
+	// GitHub API to get the content
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", username, repoName, filePath)
+	fmt.Printf("Trying GitHub API: %s\n", apiURL)
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if s.githubToken != "" {
+		req.Header.Set("Authorization", "token "+s.githubToken)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var content GitHubContent
+		if err := json.NewDecoder(resp.Body).Decode(&content); err != nil {
+			return "", err
+		}
+		
+		if content.Encoding == "base64" {
+			// Decode base64 content
+			decoded, err := base64.StdEncoding.DecodeString(content.Content)
+			if err != nil {
+				return "", err
+			}
+			return string(decoded), nil
+		}
+		return content.Content, nil
+	}
+
+	return "", fmt.Errorf("content not found for %s/%s/%s in any branch or via GitHub Pages", username, repoName, filePath)
+}
 
 // Serve GitHub Pages site content
 func (s *ZServer) serveGitHubPagesSite(conn net.Conn, domain string) {
@@ -449,85 +527,7 @@ func (s *ZServer) serveGitHubPagesSite(conn net.Conn, domain string) {
 	conn.Write([]byte(htmlContent))
 }
 
-// Fetch index.html from a GitHub Pages repository
-func (s *ZServer) fetchGitHubPagesHTML(username, repoName, filePath string) (string, error) {
-	// Try different strategies to fetch the content
-	
-	// Strategy 1: Try GitHub Pages direct URL (this is what users actually see)
-	pagesURL := fmt.Sprintf("https://%s.github.io/%s/%s", username, repoName, filePath)
-	if repoName == fmt.Sprintf("%s.github.io", username) {
-		// For user/org pages, the URL is just username.github.io
-		pagesURL = fmt.Sprintf("https://%s.github.io/%s", username, filePath)
-	}
-	
-	fmt.Printf("Trying GitHub Pages URL: %s\n", pagesURL)
-	htmlContent, err := s.fetchRawContent(pagesURL)
-	if err == nil {
-		fmt.Printf("SUCCESS: Found content at GitHub Pages URL\n")
-		return htmlContent, nil
-	}
-	fmt.Printf("GitHub Pages URL failed: %v\n", err)
 
-	// Strategy 2: Try raw GitHub content from different branches
-	branches := []string{"gh-pages", "main", "master"}
-	
-	for _, branch := range branches {
-		// Try different raw URL formats
-		rawURLs := []string{
-			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", username, repoName, branch, filePath),
-			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s", username, repoName, branch, filePath),
-		}
-		
-		for _, rawURL := range rawURLs {
-			fmt.Printf("Trying raw URL: %s\n", rawURL)
-			htmlContent, err := s.fetchRawContent(rawURL)
-			if err == nil {
-				fmt.Printf("SUCCESS: Found content at raw URL\n")
-				return htmlContent, nil
-			}
-			fmt.Printf("Raw URL failed: %v\n", err)
-		}
-	}
-
-	// Strategy 3: Try GitHub API to get the content
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", username, repoName, filePath)
-	fmt.Printf("Trying GitHub API: %s\n", apiURL)
-	
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return "", err
-	}
-
-	if s.githubToken != "" {
-		req.Header.Set("Authorization", "token "+s.githubToken)
-	}
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		var content GitHubContent
-		if err := json.NewDecoder(resp.Body).Decode(&content); err != nil {
-			return "", err
-		}
-		
-		if content.Encoding == "base64" {
-			// Decode base64 content
-			decoded, err := base64.StdEncoding.DecodeString(content.Content)
-			if err != nil {
-				return "", err
-			}
-			return string(decoded), nil
-		}
-		return content.Content, nil
-	}
-
-	return "", fmt.Errorf("content not found for %s/%s/%s in any branch or via GitHub Pages", username, repoName, filePath)
-}
 
 // Fetch raw content from a URL
 func (s *ZServer) fetchRawContent(url string) (string, error) {
