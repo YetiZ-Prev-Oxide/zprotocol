@@ -108,9 +108,44 @@ func (s *ZServer) handleConnection(conn net.Conn) {
 		s.serveFile(conn, path)
 	case "ZDEPLOY":
 		s.handleDeploy(conn, reader, path)
+	case "ZVALIDATE":
+		s.handleValidate(conn, path)
 	default:
 		conn.Write([]byte("Z/1.0 405 Method Not Allowed\n\n"))
 	}
+}
+
+func (s *ZServer) handleValidate(conn net.Conn, domain string) {
+	validateURL := fmt.Sprintf("https://d488-101-251-6-84.ngrok-free.app/check-domain?domain=%s", domain)  // NGROK NABIN SERVER
+
+	req, err := http.NewRequest("GET", validateURL, nil)
+	if err != nil {
+		conn.Write([]byte("false"))
+		return
+	}
+	req.Header.Set("User-Agent", "Z-Protocol-Server")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		conn.Write([]byte("false"))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		conn.Write([]byte("false"))
+		return
+	}
+
+	var result struct {
+		Available bool `json:"available"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		conn.Write([]byte("false"))
+		return
+	}
+
+	conn.Write([]byte(fmt.Sprintf("%v", result.Available)))
 }
 
 func (s *ZServer) extractDomainFromURL(input string) string {

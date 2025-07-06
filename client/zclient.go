@@ -67,21 +67,30 @@ func zipFolder(folderPath string) ([]byte, error) {
 }
 
 func sendRequest(request []byte) {
-	conn, err := net.Dial("tcp", "0.tcp.in.ngrok.io:11291") // Change host:port for remote server localhost:8080
+	conn, err := net.Dial("tcp", "0.tcp.in.ngrok.io:11291")  // TCP NGROK UTX
 	if err != nil {
 		fmt.Println("Connection error:", err)
 		return
 	}
 	defer conn.Close()
 
-	conn.Write(request)
-
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		fmt.Println(scanner.Text())
+	_, err = conn.Write(request)
+	if err != nil {
+		fmt.Println("Write error:", err)
+		return
 	}
-	fmt.Println()
+
+	// read full response
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		fmt.Println("Read error:", err)
+		return
+	}
+
+	fmt.Println(string(buf[:n]))
 }
+
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
@@ -91,7 +100,8 @@ func main() {
 		fmt.Println("Choose request type:")
 		fmt.Println("1. ZGET - Get file")
 		fmt.Println("2. ZDEPLOY - Deploy site to GitHub then to YetiZ")
-		fmt.Println("3. Exit")
+		fmt.Println("3. ZVALIDATE - To check validity of domain")
+		fmt.Println("4. Exit")
 		fmt.Print("Action: ")
 
 		choiceStr, _ := reader.ReadString('\n')
@@ -138,7 +148,13 @@ func main() {
 
 			reqBytes := append([]byte(request), zipData...)
 			sendRequest(reqBytes)
-
+		case 3:
+			// ZVALIDATE
+			fmt.Print("Enter domain to check (e.g. nishant): ")
+			path, _ := reader.ReadString('\n')
+			path = strings.TrimSpace(path)
+			request := fmt.Sprintf("ZVALIDATE %s Z/1.0\n\n", path)
+			sendRequest([]byte(request))
 		default:
 			fmt.Println("Invalid choice. Please try again.")
 		}
