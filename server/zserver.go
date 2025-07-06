@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"encoding/base64"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -52,7 +54,7 @@ func NewZServer() *ZServer {
 
 	repoURL := os.Getenv("REPO_URL")
 	username := os.Getenv("GITHUB_USERNAME")
-	
+
 	return &ZServer{
 		githubToken: os.Getenv("GITHUB_TOKEN"),
 		repoURL:     repoURL,
@@ -93,8 +95,13 @@ func (s *ZServer) handleConnection(conn net.Conn) {
 	method := parts[0]
 	path := parts[1]
 
-	// Clean path
-	path = strings.TrimPrefix(path, "/")
+	// don't clean the path if full URL 
+	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		// clean path for non-URLs
+		path = strings.TrimPrefix(path, "/")
+	}
+
+	fmt.Printf("Received request: %s %s\n", method, path) // Debug log
 
 	switch method {
 	case "ZGET":
@@ -106,19 +113,269 @@ func (s *ZServer) handleConnection(conn net.Conn) {
 	}
 }
 
+func (s *ZServer) extractDomainFromURL(input string) string {
+	//  protocol prefixes remoce
+	input = strings.TrimPrefix(input, "https://")
+	input = strings.TrimPrefix(input, "http://")
+	
+	// removin trailing slash if present
+	input = strings.TrimSuffix(input, "/")
+	
+	return input
+}
+
+//  external URLs
+func (s *ZServer) serveExternalURL(conn net.Conn, url string) {
+	fmt.Printf("Fetching external URL: %s\n", url)
+	
+	content, err := s.fetchRawContent(url)
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 500 Fetch Error: %v\n\n", err)))
+		return
+	}
+	
+	conn.Write([]byte(content))
+}
+
 func (s *ZServer) serveFile(conn net.Conn, path string) {
+	fmt.Printf("serveFile called with path: %s\n", path) // Debug log
+	
 	if path == "" {
 		path = "index.html"
 	}
 
-	// Check if this is a domain-based request (ends with .z)
+	// Check if its full URL (start with http/https)
+	if strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "http://") {
+		// fmt.Printf("Detected full URL: %s\n", path) // Debug log
+		domain := s.extractDomainFromURL(path)
+		// fmt.Printf("Extracted domain: %s\n", domain) // Debug log
+		
+		// check if gitPages domain
+		if s.isGitHubPagesDomain(domain) {
+			fmt.Printf("Identified as GitHub Pages domain\n") // Debug log
+			s.serveGitHubPagesSite(conn, domain)
+			return
+		}
+		
+		// For non-git URLs, try fetch directly
+		// fmt.Printf("Fetching as external URL\n") // Debug log
+		s.serveExternalURL(conn, path)
+		return
+	}
+
+	// check if domain-based request (ends with .z)
 	if strings.HasSuffix(path, ".z") {
+		// fmt.Printf("Detected .z domain request: %s\n", path) // Debug log
+		domain := strings.TrimSuffix(path, ".z")
+		
+		// handle full URLs by extracting  domain 
+		domain = s.extractDomainFromURL(domain)
+
+		// Check if it's a git Pages domain
+		if s.isGitHubPagesDomain(domain) {
+			// fmt.Printf("Identified as GitHub Pages domain via .z\n") // Debug log
+			s.serveGitHubPagesSite(conn, domain)
+			return
+		}
+
+		//  serve from private repository
+		// fmt.Printf("Serving from own repository\n") // Debug log
 		s.serveDomainSiteFromGitHub(conn, path)
 		return
 	}
 
 	// Handle regular file serving
+	fmt.Printf("Serving as regular file\n") // Debug log
 	s.serveRegularFile(conn, path)
+}
+
+// Check if a domain is a GitHub Pages domain
+func (s *ZServer) isGitHubPagesDomain(domain string) bool {
+	//  patterns like: username.github.io, username.github.io/repo
+	githubPagesPattern := regexp.MustCompile(`^[a-zA-Z0-9\-]+\.github\.io(?:/[a-zA-Z0-9\-_.]+)?$`)
+	return githubPagesPattern.MatchString(domain)
+}
+
+// Serve GitHub Pages site content
+func (s *ZServer) serveGitHubPagesSite(conn net.Conn, domain string) {
+	fmt.Printf("Fetching GitHub Pages site: %s\n", domain)
+
+	// Parse the domain to extract username and repo
+	parts := strings.Split(domain, "/")
+	if len(parts) < 1 {
+		conn.Write([]byte("Z/1.0 400 Invalid GitHub Pages domain\n\n"))
+		return
+	}
+
+	// Extract username from domain (e.g., "nishant-cmd" from "nishant-cmd.github.io")
+	hostParts := strings.Split(parts[0], ".")
+	if len(hostParts) < 3 || hostParts[1] != "github" || hostParts[2] != "io" {
+		conn.Write([]byte("Z/1.0 400 Invalid GitHub Pages domain format\n\n"))
+		return
+	}
+
+	username := hostParts[0]
+	var repoName string
+	var filePath string = "index.html" // Default file
+
+	// Determine repository name and file path
+	if len(parts) > 1 {
+		// Format: username.github.io/repo-name
+		repoName = parts[1]
+		// Check if there are additional path components
+		if len(parts) > 2 {
+			filePath = strings.Join(parts[2:], "/")
+			if !strings.HasSuffix(filePath, ".html") && !strings.Contains(filePath, ".") {
+				filePath = filePath + "/index.html"
+			}
+		}
+	} else {
+		// Format: username.github.io (typically maps to username.github.io repo)
+		repoName = fmt.Sprintf("%s.github.io", username)
+	}
+
+	fmt.Printf("Trying to fetch: username=%s, repo=%s, file=%s\n", username, repoName, filePath)
+
+	// Try to fetch the content
+	htmlContent, err := s.fetchGitHubPagesHTML(username, repoName, filePath)
+	if err != nil {
+		// If failed, try some common variations
+		if repoName == fmt.Sprintf("%s.github.io", username) {
+			// Try with different case variations
+			variations := []string{
+				strings.ToLower(repoName),
+				strings.ToUpper(repoName),
+				repoName,
+			}
+			
+			for _, variation := range variations {
+				htmlContent, err = s.fetchGitHubPagesHTML(username, variation, filePath)
+				if err == nil {
+					conn.Write([]byte(htmlContent))
+					return
+				}
+			}
+		}
+		
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 500 Fetch Error: %v\n\n", err)))
+		return
+	}
+
+	// Success! Return the content
+	conn.Write([]byte(htmlContent))
+}
+
+// Fetch index.html from a GitHub Pages repository
+func (s *ZServer) fetchGitHubPagesHTML(username, repoName, filePath string) (string, error) {
+	// Try different strategies to fetch the content
+	
+	// Strategy 1: Try GitHub Pages direct URL (this is what users actually see)
+	pagesURL := fmt.Sprintf("https://%s.github.io/%s/%s", username, repoName, filePath)
+	if repoName == fmt.Sprintf("%s.github.io", username) {
+		// For user/org pages, the URL is just username.github.io
+		pagesURL = fmt.Sprintf("https://%s.github.io/%s", username, filePath)
+	}
+	
+	fmt.Printf("Trying GitHub Pages URL: %s\n", pagesURL)
+	htmlContent, err := s.fetchRawContent(pagesURL)
+	if err == nil {
+		fmt.Printf("SUCCESS: Found content at GitHub Pages URL\n")
+		return htmlContent, nil
+	}
+	fmt.Printf("GitHub Pages URL failed: %v\n", err)
+
+	// Strategy 2: Try raw GitHub content from different branches
+	branches := []string{"gh-pages", "main", "master"}
+	
+	for _, branch := range branches {
+		// Try different raw URL formats
+		rawURLs := []string{
+			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", username, repoName, branch, filePath),
+			fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s", username, repoName, branch, filePath),
+		}
+		
+		for _, rawURL := range rawURLs {
+			fmt.Printf("Trying raw URL: %s\n", rawURL)
+			htmlContent, err := s.fetchRawContent(rawURL)
+			if err == nil {
+				fmt.Printf("SUCCESS: Found content at raw URL\n")
+				return htmlContent, nil
+			}
+			fmt.Printf("Raw URL failed: %v\n", err)
+		}
+	}
+
+	// Strategy 3: Try GitHub API to get the content
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", username, repoName, filePath)
+	fmt.Printf("Trying GitHub API: %s\n", apiURL)
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if s.githubToken != "" {
+		req.Header.Set("Authorization", "token "+s.githubToken)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var content GitHubContent
+		if err := json.NewDecoder(resp.Body).Decode(&content); err != nil {
+			return "", err
+		}
+		
+		if content.Encoding == "base64" {
+			// Decode base64 content
+			decoded, err := base64.StdEncoding.DecodeString(content.Content)
+			if err != nil {
+				return "", err
+			}
+			return string(decoded), nil
+		}
+		return content.Content, nil
+	}
+
+	return "", fmt.Errorf("content not found for %s/%s/%s in any branch or via GitHub Pages", username, repoName, filePath)
+}
+
+// Fetch raw content from a URL
+func (s *ZServer) fetchRawContent(url string) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// Add authorization header if we have a token (helps with rate limits)
+	if s.githubToken != "" {
+		req.Header.Set("Authorization", "token "+s.githubToken)
+	}
+	
+	// Add user agent to avoid being blocked
+	req.Header.Set("User-Agent", "Z-Protocol-Server/1.0")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	contentBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(contentBytes), nil
 }
 
 func (s *ZServer) serveDomainSiteFromGitHub(conn net.Conn, domain string) {
@@ -148,11 +405,11 @@ func (s *ZServer) serveDomainSiteFromGitHub(conn net.Conn, domain string) {
 func (s *ZServer) findSiteFolderByDomain(requestedDomain string) (string, error) {
 	// Construct expected folder name using the same logic as sanitizeDomainName
 	expectedFolderName := s.sanitizeDomainName(requestedDomain)
-	
+
 	// Check if the folder exists directly
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/sites/%s", 
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/sites/%s",
 		s.username, s.repoName, expectedFolderName)
-	
+
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return "", err
@@ -180,9 +437,11 @@ func (s *ZServer) findSiteFolderByDomain(requestedDomain string) (string, error)
 }
 
 func (s *ZServer) fetchRawHTML(siteFolder string) (string, error) {
-	// Use raw.githubusercontent.com for direct file access
-	rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/main/sites/%s/index.html", 
+	// Use raw.githubusercontent.com with correct refs/heads/ path
+	rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/main/sites/%s/index.html",
 		s.username, s.repoName, siteFolder)
+
+	fmt.Printf("Trying URL: %s\n", rawURL) // Debug output
 
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
@@ -201,7 +460,30 @@ func (s *ZServer) fetchRawHTML(siteFolder string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTML file not found: %d", resp.StatusCode)
+		// Try master branch if main fails
+		rawURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/master/sites/%s/index.html",
+			s.username, s.repoName, siteFolder)
+
+		fmt.Printf("Main failed, trying master: %s\n", rawURL) // Debug output
+
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return "", err
+		}
+
+		if s.githubToken != "" {
+			req.Header.Set("Authorization", "token "+s.githubToken)
+		}
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("HTML file not found in main or master branch: %d", resp.StatusCode)
+		}
 	}
 
 	htmlBytes, err := io.ReadAll(resp.Body)
@@ -314,7 +596,7 @@ func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 		return
 	}
 
-	// Prepare a temp dir to unzip to
+	//  a temp dir to unzip to
 	tempDir, err := os.MkdirTemp("", "zdeploy-")
 	if err != nil {
 		conn.Write([]byte("Z/1.0 500 Internal Server Error\n\n"))
@@ -333,7 +615,7 @@ func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 		return
 	}
 
-	// Validate uploaded folder structure inside tempDir
+	// validate uploaded folder structure inside tempDir
 	config, err := s.validateUploadDirectory(tempDir)
 	if err != nil {
 		conn.Write([]byte(fmt.Sprintf("Z/1.0 400 Validation Failed: %v\n\n", err)))
@@ -351,7 +633,7 @@ func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 
 	folderName := s.sanitizeDomainName(config.Domain)
 	githubURL := fmt.Sprintf("https://%s.github.io/%s/sites/%s/", s.username, s.repoName, folderName)
-	response := fmt.Sprintf("Z/1.0 200 Deployed\nSite: %s\nDomain: %s\nLocation: %s\n\n", config.Title, strings.ToLower(config.Domain), githubURL)	
+	response := fmt.Sprintf("Z/1.0 200 Deployed\nSite: %s\nDomain: %s\nLocation: %s\n\n", config.Title, strings.ToLower(config.Domain), githubURL)
 	conn.Write([]byte(response))
 }
 
@@ -365,20 +647,20 @@ func (s *ZServer) deploySite(localFolderPath string, config *SiteConfig) error {
 		return err
 	}
 
-	// Create target directory in repo
+	// create target directory in repo
 	targetDir := filepath.Join(repoDir, "sites", folderName)
 	err = os.MkdirAll(targetDir, 0755)
 	if err != nil {
 		return err
 	}
 
-	// Copy all files from local folder to target directory
+	// copy all files from local folder to target directory
 	err = s.copyDirectory(localFolderPath, targetDir)
 	if err != nil {
 		return err
 	}
 
-	// Commit and push
+	// commit and push
 	return s.commitAndPush(r, folderName, config)
 }
 
@@ -423,7 +705,7 @@ func (s *ZServer) cloneOrPullRepo(repoDir string) (*git.Repository, error) {
 		}
 	}
 
-	fmt.Println("Cloning repository...")
+	// cloning
 	r, err := git.PlainClone(repoDir, false, &git.CloneOptions{
 		URL:  s.repoURL,
 		Auth: auth,
@@ -489,24 +771,24 @@ func (s *ZServer) commitAndPush(r *git.Repository, folderName string, config *Si
 }
 
 func (s *ZServer) validateUploadDirectory(uploadDir string) (*SiteConfig, error) {
-	// Check if directory exists
+	// check if directory exists
 	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
 		return nil, fmt.Errorf("directory does not exist: %s", uploadDir)
 	}
 
-	// Check if config.json exists
+	// check if config.json exists
 	configPath := filepath.Join(uploadDir, "config.json")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("config.json not found in directory: %s", uploadDir)
 	}
 
-	// Check if index.html exists
+	// check if index.html exists
 	indexPath := filepath.Join(uploadDir, "index.html")
 	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("index.html not found in directory: %s", uploadDir)
 	}
 
-	// Read and parse config.json
+	// read and parse config.json
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config.json: %v", err)
@@ -518,7 +800,7 @@ func (s *ZServer) validateUploadDirectory(uploadDir string) (*SiteConfig, error)
 		return nil, fmt.Errorf("failed to parse config.json: %v", err)
 	}
 
-	// Validate required fields
+	// validate required fields
 	if strings.TrimSpace(config.Title) == "" {
 		return nil, fmt.Errorf("config.json must contain a non-empty 'title' field")
 	}
@@ -548,10 +830,11 @@ func main() {
 	fmt.Println("  ZDEPLOY - Deploy sites to GitHub")
 	fmt.Println("")
 	fmt.Println("Usage:")
-	fmt.Println("  ZGET filename.html    - Serve regular file")
-	fmt.Println("  ZGET domain.z         - Serve GitHub site content")
+	fmt.Println("  ZGET domain.z           - Serve private repo's GitHub site content")
+	fmt.Println("  ZGET username.github.io.z    - Serve any GitHub Pages site")
+	fmt.Println("  ZGET username.github.io/repo.z - Serve specific GitHub Pages repo")
 	fmt.Println("")
-	fmt.Printf("GitHub Repository: https://github.com/%s/%s\n", server.username, server.repoName)
+	fmt.Printf("GitHub Private host Repository: https://github.com/%s/%s\n", server.username, server.repoName)
 
 	if server.githubToken != "" {
 		fmt.Println("GitHub integration: ENABLED")
