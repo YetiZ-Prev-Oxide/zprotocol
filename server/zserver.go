@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -62,20 +65,12 @@ func (s *ZServer) handleConnection(conn net.Conn) {
 	method := parts[0]
 	path := parts[1]
 
-	// Path validity check
-	if !strings.HasPrefix(path, "/") {
-		conn.Write([]byte("Z/1.0 400 Bad Request\n\n"))
-		return
-	}
-
 	// Clean path
 	path = strings.TrimPrefix(path, "/")
 
 	switch method {
 	case "ZGET":
 		s.serveFile(conn, path)
-	case "ZPUT":
-		s.handlePut(conn, reader, path)
 	case "ZDEPLOY":
 		s.handleDeploy(conn, reader, path)
 	default:
@@ -84,9 +79,22 @@ func (s *ZServer) handleConnection(conn net.Conn) {
 }
 
 func (s *ZServer) serveFile(conn net.Conn, path string) {
-	// Default to index.html if path is empty
 	if path == "" {
 		path = "index.html"
+	}
+
+	// Handle `.z` as an alias for `.html`
+	if strings.HasSuffix(path, ".z") {
+		path = strings.TrimSuffix(path, ".z") + ".html"
+	}
+
+	// Add .html if no extension and .html file exists in public
+	if filepath.Ext(path) == "" {
+		possibleHTML := path + ".html"
+		fullHTMLPath := filepath.Join(s.publicDir, possibleHTML)
+		if _, err := os.Stat(fullHTMLPath); err == nil {
+			path = possibleHTML
+		}
 	}
 
 	fullPath := filepath.Join(s.publicDir, path)
@@ -96,7 +104,7 @@ func (s *ZServer) serveFile(conn net.Conn, path string) {
 		return
 	}
 
-	// Determine content type based on file extension
+	// Determine content type
 	contentType := "text/plain"
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
@@ -119,53 +127,96 @@ func (s *ZServer) serveFile(conn net.Conn, path string) {
 	conn.Write(content)
 }
 
-func (s *ZServer) handlePut(conn net.Conn, reader *bufio.Reader, path string) {
-	headers := make(map[string]string)
-	for {
-		line, _ := reader.ReadString('\n')
-		if line == "\n" || line == "\r\n" {
-			break
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
+// func (s *ZServer) handlePut(conn net.Conn, reader *bufio.Reader, path string) {
+// 	headers := make(map[string]string)
+// 	for {
+// 		line, _ := reader.ReadString('\n')
+// 		if line == "\n" || line == "\r\n" {
+// 			break
+// 		}
+// 		parts := strings.SplitN(line, ":", 2)
+// 		if len(parts) == 2 {
+// 			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+// 		}
+// 	}
 
-	length := 0
-	fmt.Sscanf(headers["Content-Length"], "%d", &length)
+// 	length := 0
+// 	fmt.Sscanf(headers["Content-Length"], "%d", &length)
 
-	content := make([]byte, length)
-	_, err := reader.Read(content)
+// 	content := make([]byte, length)
+// 	_, err := reader.Read(content)
+// 	if err != nil {
+// 		conn.Write([]byte("Z/1.0 500 Internal Server Error\n\n"))
+// 		return
+// 	}
+
+// 	fmt.Printf("Content received for file %s: %s\n", path, string(content))
+
+// 	// Ensure public directory exists
+// 	fullPath := filepath.Join(s.publicDir, path)
+// 	dir := filepath.Dir(fullPath)
+// 	os.MkdirAll(dir, 0755)
+
+// 	err = os.WriteFile(fullPath, content, 0644)
+// 	if err != nil {
+// 		conn.Write([]byte("Z/1.0 500 Write Failed\n\n"))
+// 		return
+// 	}
+
+// 	conn.Write([]byte("Z/1.0 201 Created\n\n"))
+// }
+func unzipData(data []byte, dest string) error {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		conn.Write([]byte("Z/1.0 500 Internal Server Error\n\n"))
-		return
+		return err
 	}
 
-	fmt.Printf("Content received for file %s: %s\n", path, string(content))
+	for _, f := range reader.File {
+		fpath := filepath.Join(dest, f.Name)
+		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", fpath)
+		}
 
-	// Ensure public directory exists
-	fullPath := filepath.Join(s.publicDir, path)
-	dir := filepath.Dir(fullPath)
-	os.MkdirAll(dir, 0755)
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
 
-	err = os.WriteFile(fullPath, content, 0644)
-	if err != nil {
-		conn.Write([]byte("Z/1.0 500 Write Failed\n\n"))
-		return
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return err
+		}
 	}
 
-	conn.Write([]byte("Z/1.0 201 Created\n\n"))
+	return nil
 }
 
-// New method: Handle site deployment to GitHub
+// method: Handle site deployment to GitHub
 func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 	if s.githubToken == "" || s.repoURL == "" || s.username == "" {
 		conn.Write([]byte("Z/1.0 500 GitHub not configured\n\n"))
 		return
 	}
 
-	// Read the local folder path from the request body
 	headers := make(map[string]string)
 	for {
 		line, _ := reader.ReadString('\n')
@@ -180,45 +231,54 @@ func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 
 	length := 0
 	fmt.Sscanf(headers["Content-Length"], "%d", &length)
+	contentType := headers["Content-Type"]
 
-	folderPathData := make([]byte, length)
-	_, err := reader.Read(folderPathData)
+	data := make([]byte, length)
+	_, err := io.ReadFull(reader, data)
 	if err != nil {
 		conn.Write([]byte("Z/1.0 500 Internal Server Error\n\n"))
 		return
 	}
 
-	folderPath := strings.TrimSpace(string(folderPathData))
-	if folderPath == "" {
-		conn.Write([]byte("Z/1.0 400 No folder path provided\n\n"))
+	// Prepare a temp dir to unzip to
+	tempDir, err := os.MkdirTemp("", "zdeploy-")
+	if err != nil {
+		conn.Write([]byte("Z/1.0 500 Internal Server Error\n\n"))
+		return
+	}
+	defer os.RemoveAll(tempDir) // cleanup
+
+	if contentType == "application/zip" {
+		err = unzipData(data, tempDir)
+		if err != nil {
+			conn.Write([]byte(fmt.Sprintf("Z/1.0 400 Unzip Failed: %v\n\n", err)))
+			return
+		}
+	} else {
+		conn.Write([]byte("Z/1.0 400 Unsupported Content-Type\n\n"))
 		return
 	}
 
-	fmt.Printf("Deploying site from folder: %s\n", folderPath)
-
-	// Validate the folder and get config
-	config, err := s.validateUploadDirectory(folderPath)
+	// Validate uploaded folder structure inside tempDir
+	config, err := s.validateUploadDirectory(tempDir)
 	if err != nil {
-		fmt.Printf("Validation failed: %v\n", err)
 		conn.Write([]byte(fmt.Sprintf("Z/1.0 400 Validation Failed: %v\n\n", err)))
 		return
 	}
 
-	fmt.Printf("Site Title: %s, Domain: %s\n", config.Title, config.Domain)
+	fmt.Printf("Deploying site: %s, domain: %s\n", config.Title, config.Domain)
 
-	// Deploy the site
-	err = s.deploySite(folderPath, config)
+	// Deploy site from tempDir
+	err = s.deploySite(tempDir, config)
 	if err != nil {
-		fmt.Printf("Deploy error: %v\n", err)
-		conn.Write([]byte("Z/1.0 500 Deploy Failed\n\n"))
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 500 Deploy Failed: %v\n\n", err)))
 		return
 	}
 
-	// Return success with GitHub Pages URL
 	folderName := s.sanitizeDomainName(config.Domain)
 	repoName := s.extractRepoName(s.repoURL)
 	githubURL := fmt.Sprintf("https://%s.github.io/%s/sites/%s/", s.username, repoName, folderName)
-	
+
 	response := fmt.Sprintf("Z/1.0 200 Deployed\nSite: %s\nDomain: %s\nLocation: %s\n\n", config.Title, config.Domain, githubURL)
 	conn.Write([]byte(response))
 }
@@ -226,7 +286,7 @@ func (s *ZServer) handleDeploy(conn net.Conn, reader *bufio.Reader, _ string) {
 func (s *ZServer) deploySite(localFolderPath string, config *SiteConfig) error {
 	folderName := s.sanitizeDomainName(config.Domain)
 	repoDir := filepath.Join(os.TempDir(), "z-protocol-repo")
-	
+
 	// Clone or pull repo
 	r, err := s.cloneOrPullRepo(repoDir)
 	if err != nil {
@@ -257,17 +317,17 @@ func (s *ZServer) sanitizeDomainName(domain string) string {
 	domain = strings.ReplaceAll(domain, "/", "-")
 	domain = strings.ReplaceAll(domain, ":", "-")
 	domain = strings.ReplaceAll(domain, " ", "-")
-	
+
 	for strings.Contains(domain, "--") {
 		domain = strings.ReplaceAll(domain, "--", "-")
 	}
-	
+
 	domain = strings.Trim(domain, "-")
-	
+
 	if len(domain) > 30 {
 		domain = domain[:30]
 	}
-	
+
 	return domain
 }
 
@@ -422,9 +482,8 @@ func main() {
 	fmt.Println("Z Protocol Server running on port 8080...")
 	fmt.Println("Supported methods:")
 	fmt.Println("  ZGET  - Retrieve files")
-	fmt.Println("  ZPUT  - Upload files")
 	fmt.Println("  ZDEPLOY - Deploy sites to GitHub")
-	
+
 	if server.githubToken != "" {
 		fmt.Println("GitHub integration: ENABLED")
 	} else {
