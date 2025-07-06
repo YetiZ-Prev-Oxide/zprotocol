@@ -171,6 +171,13 @@ func (s *ZServer) serveExternalURL(conn net.Conn, url string) {
 	
 	conn.Write([]byte(content))
 }
+//SUPPORT FETCHES
+
+// ZGET nishant.z → serves index.html (existing functionality)
+// ZGET nishant.z/css → serves style.css
+// ZGET nishant.z/style.css → serves style.css (direct file access)
+// ZGET nishant.z/custom.css → serves custom.css (any CSS file)
+// ZGET nishant.z/about.html → serves about.html (any HTML file)
 
 func (s *ZServer) serveFile(conn net.Conn, path string) {
 	fmt.Printf("serveFile called with path: %s\n", path) // Debug log
@@ -181,9 +188,7 @@ func (s *ZServer) serveFile(conn net.Conn, path string) {
 
 	// Check if its full URL (start with http/https)
 	if strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "http://") {
-		// fmt.Printf("Detected full URL: %s\n", path) // Debug log
 		domain := s.extractDomainFromURL(path)
-		// fmt.Printf("Extracted domain: %s\n", domain) // Debug log
 		
 		// check if gitPages domain
 		if s.isGitHubPagesDomain(domain) {
@@ -193,35 +198,179 @@ func (s *ZServer) serveFile(conn net.Conn, path string) {
 		}
 		
 		// For non-git URLs, try fetch directly
-		// fmt.Printf("Fetching as external URL\n") // Debug log
 		s.serveExternalURL(conn, path)
 		return
 	}
 
-	// check if domain-based request (ends with .z)
-	if strings.HasSuffix(path, ".z") {
-		// fmt.Printf("Detected .z domain request: %s\n", path) // Debug log
-		domain := strings.TrimSuffix(path, ".z")
+	// Check if domain-based request (ends with .z)
+	if strings.HasSuffix(path, ".z") || strings.Contains(path, ".z/") {
+		var domain string
+		var assetPath string
 		
-		// handle full URLs by extracting  domain 
-		domain = s.extractDomainFromURL(domain)
+		// Parse domain and asset path
+		if strings.Contains(path, ".z/") {
+			// Format: domain.z/css or domain.z/style.css
+			parts := strings.SplitN(path, ".z/", 2)
+			domain = parts[0] + ".z"
+			assetPath = parts[1]
+			
+			// Only allow HTML and CSS files
+			if assetPath == "css" {
+				assetPath = "style.css"
+			} else if !strings.HasSuffix(assetPath, ".html") && !strings.HasSuffix(assetPath, ".css") {
+				conn.Write([]byte("Z/1.0 403 Forbidden - Only HTML and CSS files allowed\n\n"))
+				return
+			}
+		} else {
+			// Format: domain.z (default to index.html)
+			domain = path
+			assetPath = "index.html"
+		}
+		
+		// Remove .z suffix from domain for processing
+		domainName := strings.TrimSuffix(domain, ".z")
+		domainName = s.extractDomainFromURL(domainName)
 
-		// Check if it's a git Pages domain
-		if s.isGitHubPagesDomain(domain) {
-			// fmt.Printf("Identified as GitHub Pages domain via .z\n") // Debug log
-			s.serveGitHubPagesSite(conn, domain)
+		// Check if it's a GitHub Pages domain
+		if s.isGitHubPagesDomain(domainName) {
+			fmt.Printf("Identified as GitHub Pages domain via .z\n") // Debug log
+			s.serveGitHubPagesSiteAsset(conn, domainName, assetPath)
 			return
 		}
 
-		//  serve from private repository
-		// fmt.Printf("Serving from own repository\n") // Debug log
-		s.serveDomainSiteFromGitHub(conn, path)
+		// Serve from private repository
+		fmt.Printf("Serving from own repository\n") // Debug log
+		s.serveDomainSiteAssetFromGitHub(conn, domain, assetPath)
 		return
 	}
 
 	// Handle regular file serving
 	fmt.Printf("Serving as regular file\n") // Debug log
 	s.serveRegularFile(conn, path)
+}
+
+func (s *ZServer) serveDomainSiteAssetFromGitHub(conn net.Conn, domain string, assetPath string) {
+	if s.githubToken == "" || s.username == "" || s.repoName == "" {
+		conn.Write([]byte("Z/1.0 500 GitHub not configured\n\n"))
+		return
+	}
+
+	// Find the site folder by domain
+	siteFolder, err := s.findSiteFolderByDomain(domain)
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 404 Domain Not Found: %v\n\n", err)))
+		return
+	}
+
+	// Fetch the asset content
+	content, err := s.fetchAssetFromGitHub(siteFolder, assetPath)
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 500 Fetch Error: %v\n\n", err)))
+		return
+	}
+
+	// Return the content
+	conn.Write([]byte(content))
+}
+
+// Fetch asset (HTML or CSS) from private GitHub repository
+func (s *ZServer) fetchAssetFromGitHub(siteFolder string, assetPath string) (string, error) {
+	// Use raw.githubusercontent.com with correct refs/heads/ path
+	rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/main/sites/%s/%s",
+		s.username, s.repoName, siteFolder, assetPath)
+
+	fmt.Printf("Trying URL: %s\n", rawURL) // Debug output
+
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// Add authorization header for private repos
+	if s.githubToken != "" {
+		req.Header.Set("Authorization", "token "+s.githubToken)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		// Try master branch if main fails
+		rawURL = fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/refs/heads/master/sites/%s/%s",
+			s.username, s.repoName, siteFolder, assetPath)
+
+		fmt.Printf("Main failed, trying master: %s\n", rawURL) // Debug output
+
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return "", err
+		}
+
+		if s.githubToken != "" {
+			req.Header.Set("Authorization", "token "+s.githubToken)
+		}
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("Asset file not found in main or master branch: %d", resp.StatusCode)
+		}
+	}
+
+	contentBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(contentBytes), nil
+}
+
+// Serve GitHub Pages site asset (HTML or CSS)
+func (s *ZServer) serveGitHubPagesSiteAsset(conn net.Conn, domain string, assetPath string) {
+	fmt.Printf("Fetching GitHub Pages site asset: %s/%s\n", domain, assetPath)
+
+	// Parse the domain to extract username and repo
+	parts := strings.Split(domain, "/")
+	if len(parts) < 1 {
+		conn.Write([]byte("Z/1.0 400 Invalid GitHub Pages domain\n\n"))
+		return
+	}
+
+	// Extract username from domain
+	hostParts := strings.Split(parts[0], ".")
+	if len(hostParts) < 3 || hostParts[1] != "github" || hostParts[2] != "io" {
+		conn.Write([]byte("Z/1.0 400 Invalid GitHub Pages domain format\n\n"))
+		return
+	}
+
+	username := hostParts[0]
+	var repoName string
+
+	// Determine repository name
+	if len(parts) > 1 {
+		repoName = parts[1]
+	} else {
+		repoName = fmt.Sprintf("%s.github.io", username)
+	}
+
+	fmt.Printf("Trying to fetch asset: username=%s, repo=%s, file=%s\n", username, repoName, assetPath)
+
+	// Fetch the asset content
+	content, err := s.fetchGitHubPagesHTML(username, repoName, assetPath)
+	if err != nil {
+		conn.Write([]byte(fmt.Sprintf("Z/1.0 500 Fetch Error: %v\n\n", err)))
+		return
+	}
+
+	// Return the content
+	conn.Write([]byte(content))
 }
 
 // Check if a domain is a GitHub Pages domain
